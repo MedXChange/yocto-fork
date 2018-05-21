@@ -347,6 +347,7 @@ def wic_init_parser_create(subparser):
     subparser.add_argument("-v", "--vars", dest='vars_dir',
                       help="directory with <image>.env files that store "
                            "bitbake variables")
+    subparser.add_argument("-i", "--imager", dest="imager", default="direct", help="the wic imager plugin")
     subparser.add_argument("-D", "--debug", dest="debug", action="store_true",
                       default=False, help="output debug information")
     return
