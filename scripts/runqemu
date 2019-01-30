@@ -27,6 +27,7 @@ import fcntl
 import shutil
 import glob
 import configparser
+import signal
 
 class RunQemuError(Exception):
     """Custom exception to raise on known errors."""
@@ -217,7 +218,7 @@ class BaseConfig(object):
         self.tcpserial_portnum = ''
         self.custombiosdir = ''
         self.lock = ''
-        self.lock_descriptor = ''
+        self.lock_descriptor = None
         self.bitbake_e = ''
         self.snapshot = False
         self.fstypes = ('ext2', 'ext3', 'ext4', 'jffs2', 'nfs', 'btrfs',
@@ -233,6 +234,10 @@ class BaseConfig(object):
         # slirp qemus are running.
         self.mac_tap = "52:54:00:12:34:"
         self.mac_slirp = "52:54:00:12:35:"
+        # pid of the actual qemu process
+        self.qemupid = None
+        # avoid cleanup twice
+        self.cleaned = False
 
     def acquire_lock(self, error=True):
         logger.debug("Acquiring lockfile %s..." % self.lock)
@@ -247,13 +252,17 @@ class BaseConfig(object):
                 logger.info(msg)
             if self.lock_descriptor:
                 self.lock_descriptor.close()
+                self.lock_descriptor = None
             return False
         return True
 
     def release_lock(self):
-        fcntl.flock(self.lock_descriptor, fcntl.LOCK_UN)
-        self.lock_descriptor.close()
-        os.remove(self.lock)
+        if self.lock_descriptor:
+            logger.debug("Releasing lockfile for tap device '%s'" % self.tap)
+            fcntl.flock(self.lock_descriptor, fcntl.LOCK_UN)
+            self.lock_descriptor.close()
+            os.remove(self.lock)
+            self.lock_descriptor = None
 
     def get(self, key):
         if key in self.d:
@@ -1110,6 +1119,11 @@ class BaseConfig(object):
             qbsys = 'riscv64'
         elif mach == 'qemuriscv32':
             qbsys = 'riscv32'
+        else:
+            logger.error("Unable to determine QEMU PC System emulator for %s machine." % mach)
+            logger.error("As %s is not among valid QEMU machines such as," % mach)
+            logger.error("qemux86-64, qemux86, qemuarm64, qemuarm, qemumips64, qemumips64el, qemumipsel, qemumips, qemuppc")
+            raise RunQemuError("Set qb_system_name with suitable QEMU PC System emulator in .*qemuboot.conf.")
 
         return 'qemu-system-%s' % qbsys
 
@@ -1189,6 +1203,7 @@ class BaseConfig(object):
                 self.qemu_opt += " -serial mon:vc -serial null"
 
     def start_qemu(self):
+        import shlex
         if self.kernel:
             kernel_opts = "-kernel %s -append '%s %s %s %s'" % (self.kernel, self.kernel_cmdline,
                                                                 self.kernel_cmdline_script, self.get('QB_KERNEL_CMDLINE_APPEND'),
@@ -1198,19 +1213,33 @@ class BaseConfig(object):
         else:
             kernel_opts = ""
         cmd = "%s %s" % (self.qemu_opt, kernel_opts)
+        cmds = shlex.split(cmd)
         logger.info('Running %s\n' % cmd)
-        process = subprocess.Popen(cmd, shell=True, stderr=subprocess.PIPE)
-        if process.wait():
-            logger.error("Failed to run qemu: %s", process.stderr.read().decode())
+        pass_fds = []
+        if self.lock_descriptor:
+            pass_fds = [self.lock_descriptor.fileno()]
+        process = subprocess.Popen(cmds, stderr=subprocess.PIPE, pass_fds=pass_fds)
+        self.qemupid = process.pid
+        retcode = process.wait()
+        if retcode:
+            if retcode == -signal.SIGTERM:
+                logger.info("Qemu terminated by SIGTERM")
+            else:
+                logger.error("Failed to run qemu: %s", process.stderr.read().decode())
 
     def cleanup(self):
+        if self.cleaned:
+            return
+
+        # avoid dealing with SIGTERM when cleanup function is running
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+        logger.info("Cleaning up")
         if self.cleantap:
             cmd = 'sudo %s %s %s' % (self.qemuifdown, self.tap, self.bindir_native)
             logger.debug('Running %s' % cmd)
             subprocess.check_call(cmd, shell=True)
-        if self.lock_descriptor:
-            logger.info("Releasing lockfile for tap device '%s'" % self.tap)
-            self.release_lock()
+        self.release_lock()
 
         if self.nfs_running:
             logger.info("Shutting down the userspace NFS server...")
@@ -1226,6 +1255,8 @@ class BaseConfig(object):
             logger.info('Removing %s' % self.rootfs)
             shutil.rmtree(self.rootfs)
             shutil.rmtree('%s.pseudo_state' % self.rootfs)
+
+        self.cleaned = True
 
     def load_bitbake_env(self, mach=None):
         if self.bitbake_e:
@@ -1282,6 +1313,14 @@ def main():
         return 0
     try:
         config = BaseConfig()
+
+        def sigterm_handler(signum, frame):
+            logger.info("SIGTERM received")
+            os.kill(config.qemupid, signal.SIGTERM)
+            config.cleanup()
+            subprocess.check_call(["tput", "smam"])
+        signal.signal(signal.SIGTERM, sigterm_handler)
+
         config.check_args()
         config.read_qemuboot()
         config.check_and_set()
@@ -1300,8 +1339,8 @@ def main():
         traceback.print_exc()
         return 1
     finally:
-        print("Cleanup")
         config.cleanup()
+        subprocess.check_call(["tput", "smam"])
 
 if __name__ == "__main__":
     sys.exit(main())
